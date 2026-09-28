@@ -14,6 +14,20 @@
 - 基于字段生成柱状图、折线图、饼图 PNG
 - 本地历史任务记录和页面操作日志
 
+## 界面特性（2026-09 界面改版）
+
+- 统一设计令牌与全局样式：`excel_helper/ui/theme.py`（颜色 / 间距 / 圆角 / 按钮三级层级）
+- 可复用界面组件：`excel_helper/ui/widgets.py`
+  - `SectionCard` 卡片分组容器、`EmptyState` 空状态引导
+  - `FileListWidget` 多文件选择（拖拽 + 单文件移除 + 字段数提示）
+  - `SingleFilePicker` 单文件选择卡（拖拽 + 选择）
+  - `LogPanel` 可折叠操作日志、`FeedbackBar` 底部反馈条（替代模态弹窗）
+- 左侧导航图标 + 分组；每页统一“页头 + 唯一主按钮”
+- 合并 / 清洗 / 对比 / 图表页改为左右两栏布局
+- 清洗规则可视化开关（基于 `CleanRule.enabled`）
+- 图表页字段改为下拉选择（自动优先数值列），生成结果界面内预览
+- 历史任务支持搜索、打开输出文件、清空历史；首页新增任务统计
+
 ## 启动
 
 ```bash
@@ -26,15 +40,21 @@ python main.py
 python -m pytest
 ```
 
+> `tests/test_ui_smoke.py` 使用 Qt offscreen 平台离屏构建主窗口做冒烟验证，无需显示器。
+
 ## 目录结构
 
 ```text
 excel_helper/
-├── app.py
-├── core/
-├── chart/
-├── models/
-├── services/
-├── storage/
+├── app.py              # 启动入口
+├── core/               # pandas / openpyxl / matplotlib 数据处理
+├── chart/              # 图表工厂
+├── models/             # 数据模型
+├── services/           # 业务服务层（UI 与 core 的胶水）
+├── storage/            # 本地历史记录
 └── ui/
+    ├── theme.py        # 设计令牌 + 全局样式表
+    ├── widgets.py      # 通用界面组件
+    ├── field_selector.py
+    └── main_window.py  # 主窗口与页面编排
 ```

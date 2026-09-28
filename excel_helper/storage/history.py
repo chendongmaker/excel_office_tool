@@ -44,3 +44,12 @@ class HistoryStore:
             return json.loads(self.path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return []
+
+    def clear(self) -> None:
+        """清空全部历史记录。
+
+        上游：历史任务页的"清空历史"按钮（UI 会先做二次确认）。
+        写入空列表而不是删除文件，保持 __init__ 已创建目录的假设不变。
+        """
+
+        self.path.write_text("[]", encoding="utf-8")
