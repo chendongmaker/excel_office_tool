@@ -1,0 +1,5 @@
+pandas
+openpyxl
+PySide6
+matplotlib
+pytest
