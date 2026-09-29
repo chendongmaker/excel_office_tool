@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from excel_helper.chart.chart_factory import save_chart
 from excel_helper.core.excel_clean import apply_clean_rules
@@ -8,6 +9,7 @@ from excel_helper.core.excel_compare import compare_by_key
 from excel_helper.core.field_parser import build_field_coverage, parse_files_metadata
 from excel_helper.core.excel_merge import merge_by_key, merge_by_rows
 from excel_helper.models.rule import CleanAction, CleanRule
+from excel_helper.services.process_service import ProcessService
 
 
 def test_merge_by_rows_adds_source_file(tmp_path):
@@ -112,6 +114,41 @@ def test_clean_rules_survive_trimmed_column_names():
 
     assert list(result.columns) == ["商品", "金额"]
     assert result["商品"].item() == "A"
+
+
+def test_clean_folder_continues_after_a_file_failure(tmp_path):
+    """文件夹清洗应分别汇报成功与失败，并继续处理失败文件之后的文件。"""
+
+    source_folder = tmp_path / "input"
+    output_folder = tmp_path / "output"
+    source_folder.mkdir()
+    pd.DataFrame({"商品": [" A "]}).to_excel(source_folder / "a.xlsx", index=False)
+    (source_folder / "b.csv").write_text("", encoding="utf-8")
+    pd.DataFrame({"商品": [" B "]}).to_excel(source_folder / "c.xlsx", index=False)
+
+    result = ProcessService().clean_folder(
+        source_folder,
+        output_folder,
+        [CleanRule(CleanAction.STRIP_TEXT)],
+        columns=["商品"],
+    )
+
+    assert result.succeeded_count == 2
+    assert result.failed_count == 1
+    assert [item.succeeded for item in result.items] == [True, False, True]
+    assert (output_folder / "a_xlsx_清洗结果.xlsx").exists()
+    assert (output_folder / "c_xlsx_清洗结果.xlsx").exists()
+
+
+def test_clean_folder_rejects_empty_table_folder(tmp_path):
+    """目录中没有支持的表格时应返回可理解的输入错误。"""
+
+    source_folder = tmp_path / "input"
+    source_folder.mkdir()
+    (source_folder / "notes.txt").write_text("无表格", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="没有支持的表格文件"):
+        ProcessService().clean_folder(source_folder, tmp_path / "output", [])
 
 
 def test_compare_by_key(tmp_path):

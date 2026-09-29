@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, QUrl
@@ -47,7 +47,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from excel_helper.core.field_parser import build_field_coverage, parse_files_metadata
+from excel_helper.core.excel_reader import list_table_files
+from excel_helper.core.field_parser import build_field_coverage, parse_file_metadata, parse_files_metadata
 from excel_helper.models.field import FieldCoverage, FileMetadata
 from excel_helper.models.rule import CleanAction, CleanRule
 from excel_helper.models.task import TaskRecord, TaskStatus
@@ -97,6 +98,26 @@ CLEAN_RULE_OPTIONS: list[tuple[str, str]] = [
     (CleanAction.RENAME_COLUMNS.value, "修改列名"),
     (CleanAction.DROP_COLUMNS.value, "删除列"),
 ]
+
+
+def _describe_files(paths: list[str]) -> str:
+    """整理所选文件的路径、类型、大小和修改时间，供操作日志追溯。"""
+
+    descriptions: list[str] = []
+    for value in paths:
+        path = Path(value)
+        try:
+            metadata = path.stat()
+            size_mb = metadata.st_size / (1024 * 1024)
+            modified_at = datetime.fromtimestamp(metadata.st_mtime).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            descriptions.append(
+                f"路径={path}；类型={path.suffix.lower() or '未知'}；"
+                f"大小={size_mb:.2f} MB；修改时间={modified_at}"
+            )
+        except OSError as error:
+            # 文件可能在选中后被移动或删除，日志仍保留路径和读取元数据的失败原因。
+            descriptions.append(f"路径={path}；类型={path.suffix.lower() or '未知'}；元数据读取失败={error}")
+    return " | ".join(descriptions)
 
 # 图表类型下拉项：(显示文案, 传给 chart_factory 的值)
 CHART_TYPE_OPTIONS: list[tuple[str, str]] = [("柱状图", "bar"), ("折线图", "line"), ("饼图", "pie")]
@@ -435,6 +456,7 @@ class MainWindow(QMainWindow):
         files_card = SectionCard("选择文件", step=1, extra=self.merge_file_chip)
         self.merge_files = FileListWidget()
         self.merge_files.filesChanged.connect(self._on_merge_files_changed)
+        self.merge_files.filesRejected.connect(lambda paths: self._handle_rejected_files(self.merge_log, paths))
         files_card.add(self.merge_files)
         left.addWidget(files_card)
 
@@ -487,6 +509,8 @@ class MainWindow(QMainWindow):
     def _on_merge_files_changed(self, paths: list[str]) -> None:
         """合并页文件集合变化：更新统计、启用主按钮、重新解析字段。"""
 
+        if paths:
+            self._record_operation(self.merge_log, "文件上传", _describe_files(paths))
         self.merge_file_chip.setText(f"共 {len(paths)} 个文件")
         self.merge_run_button.setEnabled(bool(paths))
         metadata, fields = self._load_fields(paths, self.merge_field_selector, self.merge_log)
@@ -546,6 +570,13 @@ class MainWindow(QMainWindow):
 
         try:
             self._append_log(self.merge_log, f"用户选择字段：{', '.join(selected_columns)}")
+            self._record_operation(
+                self.merge_log,
+                "导出开始",
+                f"模式={'按主键匹配' if self.merge_key_radio.isChecked() else '纵向合并'}；"
+                f"输入文件={len(files)} 个；主键={key if self.merge_key_radio.isChecked() else '不适用'}；"
+                f"字段={', '.join(selected_columns)}；输出={output}",
+            )
             self._begin_task("正在合并，请稍候…")
             if self.merge_key_radio.isChecked():
                 result = self.process_service.merge_by_key(files, key, output, columns=selected_columns)
@@ -592,7 +623,17 @@ class MainWindow(QMainWindow):
         file_card = SectionCard("待清洗文件", step=1)
         self.clean_picker = SingleFilePicker("未选择文件")
         self.clean_picker.fileChanged.connect(self._on_clean_file_changed)
+        self.clean_picker.filesRejected.connect(lambda paths: self._handle_rejected_files(self.clean_log, paths))
         file_card.add(self.clean_picker)
+        self.clean_folder_path = ""
+        self.clean_folder_button = QPushButton("选择文件夹批量清洗")
+        self.clean_folder_button.setObjectName("BtnSecondary")
+        self.clean_folder_button.clicked.connect(self._select_clean_folder)
+        file_card.add(self.clean_folder_button)
+        self.clean_folder_label = QLabel("未选择文件夹")
+        self.clean_folder_label.setObjectName("MutedSmall")
+        self.clean_folder_label.setWordWrap(True)
+        file_card.add(self.clean_folder_label)
         left.addWidget(file_card)
 
         rules_card = SectionCard("清洗规则", step=2, subtitle="默认全部启用，可按需关闭")
@@ -644,11 +685,65 @@ class MainWindow(QMainWindow):
     def _on_clean_file_changed(self, path: str) -> None:
         """清洗页文件变化：解析字段并启用主按钮。"""
 
-        self.clean_run_button.setEnabled(bool(path))
+        if path:
+            # 选择单文件后切换回单文件处理模式，避免目录和文件两种输入状态混淆。
+            self.clean_folder_path = ""
+            self.clean_folder_label.setText("未选择文件夹")
+            self._record_operation(self.clean_log, "文件上传", _describe_files([path]))
+        has_input = bool(path or self.clean_folder_path)
+        self.clean_run_button.setEnabled(has_input)
         metadata, _ = self._load_fields([path] if path else [], self.clean_field_selector, self.clean_log)
         if metadata:
             item = metadata[0]
             self.clean_picker.set_meta(f"{item.sheet_name} · {len(item.columns)} 个字段")
+
+    def _select_clean_folder(self) -> None:
+        """选择批量清洗的输入文件夹，并解析其中可读取文件的字段。"""
+
+        selected_folder = QFileDialog.getExistingDirectory(self, "选择待清洗文件夹", str(Path.home()))
+        if not selected_folder:
+            return
+        try:
+            paths = list_table_files(selected_folder)
+            if not paths:
+                self._warn("所选文件夹中没有支持的表格文件")
+                return
+
+            # 进入文件夹模式时清除之前的单文件，确保后续任务只有一类明确输入。
+            self.clean_picker.clear()
+            self.clean_folder_path = selected_folder
+            self.clean_folder_label.setText(f"批量清洗文件夹：{selected_folder}（共 {len(paths)} 个表格文件）")
+            self.clean_run_button.setEnabled(True)
+            self._record_operation(
+                self.clean_log,
+                "文件夹上传",
+                f"文件夹={selected_folder}；文件数={len(paths)}；文件列表={'; '.join(str(path) for path in paths)}",
+            )
+
+            # 逐个解析，个别损坏文件不妨碍其他文件提供字段配置。
+            metadata: list[FileMetadata] = []
+            for path in paths:
+                try:
+                    metadata.append(parse_file_metadata(path))
+                except Exception as error:
+                    self._record_operation(self.clean_log, "文件解析失败", f"文件={path}；错误={error}", level="ERROR")
+            if not metadata:
+                self.clean_field_selector.set_fields([])
+                self.clean_run_button.setEnabled(False)
+                self._warn("文件夹中的表格均无法读取，请检查文件内容")
+                return
+
+            fields = build_field_coverage(metadata)
+            self.clean_field_selector.set_fields(fields)
+            self._record_operation(
+                self.clean_log,
+                "文件夹解析完成",
+                f"可读取文件={len(metadata)}/{len(paths)}；字段数={len(fields)}；"
+                f"公共字段={sum(field.is_common for field in fields)}",
+            )
+        except Exception as error:
+            self._record_operation(self.clean_log, "文件夹读取失败", f"文件夹={selected_folder}；错误={error}", level="ERROR")
+            self._warn(f"无法读取所选文件夹：{error}")
 
     def _run_clean(self) -> None:
         """执行数据清洗任务。
@@ -660,14 +755,18 @@ class MainWindow(QMainWindow):
         """
 
         source = self.clean_picker.path()
-        if not source:
-            self._warn("请先选择待清洗文件")
+        folder = self.clean_folder_path
+        if not source and not folder:
+            self._warn("请先选择待清洗文件或文件夹")
             return
         selected_columns = self.clean_field_selector.selected_fields()
         if not selected_columns:
             self._warn("请至少选择一个字段")
             return
-        output = self._save_path("保存清洗结果", ".xlsx")
+        if folder:
+            output = QFileDialog.getExistingDirectory(self, "选择批量清洗输出文件夹", str(Path(folder) / "清洗结果"))
+        else:
+            output = self._save_path("保存清洗结果", ".xlsx")
         if not output:
             return
 
@@ -721,13 +820,56 @@ class MainWindow(QMainWindow):
             self._append_log(self.clean_log, f"用户选择字段：{', '.join(selected_columns)}")
             active_rules = [rule.action.value for rule in rules if rule.enabled]
             self._append_log(self.clean_log, f"启用规则 {len(active_rules)} 条：{', '.join(active_rules)}")
-            self._begin_task("正在清洗，请稍候…")
-            result = self.process_service.clean_file(source, output, rules, columns=selected_columns)
-            self._append_log(self.clean_log, f"清洗成功：{result}")
-            self._record_success("数据清洗", [source], [result], f"清洗完成，已导出：{result}")
+            input_files = [str(path) for path in list_table_files(folder)] if folder else [source]
+            self._record_operation(
+                self.clean_log,
+                "导出开始",
+                f"模式={'文件夹批量清洗' if folder else '单文件清洗'}；输入={folder or source}；"
+                f"文件数={len(input_files)}；字段={', '.join(selected_columns)}；"
+                f"启用规则={', '.join(active_rules)}；输出={output}",
+            )
+            self._begin_task("正在批量清洗，请稍候…" if folder else "正在清洗，请稍候…")
+            if folder:
+                batch_result = self.process_service.clean_folder(
+                    folder,
+                    output,
+                    rules,
+                    columns=selected_columns,
+                )
+                output_paths = [item.output_path for item in batch_result.items if item.output_path is not None]
+                for item in batch_result.items:
+                    if item.succeeded:
+                        self._record_operation(
+                            self.clean_log,
+                            "文件清洗成功",
+                            f"输入={item.input_path}；输出={item.output_path}",
+                        )
+                    else:
+                        self._record_operation(
+                            self.clean_log,
+                            "文件清洗失败",
+                            f"输入={item.input_path}；错误={item.error}",
+                            level="ERROR",
+                        )
+                summary = (
+                    f"批量清洗完成：成功 {batch_result.succeeded_count} 个，"
+                    f"失败 {batch_result.failed_count} 个；输出目录：{output}"
+                )
+                self._append_log(self.clean_log, summary)
+                if output_paths:
+                    if batch_result.failed_count:
+                        self._record_partial("批量数据清洗", input_files, output_paths, summary)
+                    else:
+                        self._record_success("批量数据清洗", input_files, output_paths, summary)
+                else:
+                    self._record_failure("批量清洗失败", input_files, summary)
+            else:
+                result = self.process_service.clean_file(source, output, rules, columns=selected_columns)
+                self._append_log(self.clean_log, f"清洗成功：{result}")
+                self._record_success("数据清洗", [source], [result], f"清洗完成，已导出：{result}")
         except Exception as exc:
             self._append_log(self.clean_log, f"清洗失败：{exc}")
-            self._record_failure("清洗失败", [source], str(exc))
+            self._record_failure("清洗失败", [folder or source], str(exc))
 
     # ==================================================================
     # 数据对比
@@ -763,6 +905,8 @@ class MainWindow(QMainWindow):
         self.compare_right_picker = SingleFilePicker("对比文件（B · 新数据）")
         self.compare_left_picker.fileChanged.connect(self._on_compare_file_changed)
         self.compare_right_picker.fileChanged.connect(self._on_compare_file_changed)
+        self.compare_left_picker.filesRejected.connect(lambda paths: self._handle_rejected_files(self.compare_log, paths))
+        self.compare_right_picker.filesRejected.connect(lambda paths: self._handle_rejected_files(self.compare_log, paths))
         files_card.add(self.compare_left_picker)
 
         vs_label = QLabel("VS")
@@ -816,6 +960,8 @@ class MainWindow(QMainWindow):
         left = self.compare_left_picker.path()
         right = self.compare_right_picker.path()
         files = [path for path in [left, right] if path]
+        if _path:
+            self._record_operation(self.compare_log, "文件上传", _describe_files([_path]))
         self.compare_run_button.setEnabled(len(files) == 2)
 
         metadata, fields = self._load_fields(files, self.compare_field_selector, self.compare_log)
@@ -863,6 +1009,12 @@ class MainWindow(QMainWindow):
         try:
             self._append_log(self.compare_log, f"匹配主键：{key}")
             self._append_log(self.compare_log, f"对比字段：{', '.join(selected_columns)}")
+            self._record_operation(
+                self.compare_log,
+                "导出开始",
+                f"左文件={left}；右文件={right}；主键={key}；"
+                f"对比字段={', '.join(selected_columns)}；输出={output}",
+            )
             self._begin_task("正在对比，请稍候…")
             result = self.process_service.compare_files(left, right, key, output, compare_columns=selected_columns)
             self._append_log(self.compare_log, f"对比成功：{result}")
@@ -903,6 +1055,7 @@ class MainWindow(QMainWindow):
         file_card = SectionCard("数据文件", step=1)
         self.chart_picker = SingleFilePicker("未选择文件")
         self.chart_picker.fileChanged.connect(self._on_chart_file_changed)
+        self.chart_picker.filesRejected.connect(lambda paths: self._handle_rejected_files(self.chart_log, paths))
         file_card.add(self.chart_picker)
         left.addWidget(file_card)
 
@@ -959,6 +1112,7 @@ class MainWindow(QMainWindow):
             for combo in (self.chart_x_input, self.chart_y_input, self.chart_group_input):
                 combo.clear()
             return
+        self._record_operation(self.chart_log, "文件上传", _describe_files([path]))
         metadata, _ = self._load_fields([path], None, self.chart_log)
         if not metadata:
             return
@@ -1040,6 +1194,13 @@ class MainWindow(QMainWindow):
             self._append_log(
                 self.chart_log,
                 f"图表类型：{self.chart_type.currentText()}，X={x_column}，Y={y_column}",
+            )
+            self._record_operation(
+                self.chart_log,
+                "导出开始",
+                f"输入={source}；图表类型={self.chart_type.currentText()}；"
+                f"X={x_column}；Y={y_column}；分组={group or '无'}；"
+                f"标题={self.chart_title_input.text().strip() or '默认标题'}；输出={output}",
             )
             self._begin_task("正在生成图表，请稍候…")
             result = self.chart_service.create_chart(
@@ -1165,20 +1326,30 @@ class MainWindow(QMainWindow):
             return [], []
         try:
             if log is not None:
-                self._append_log(log, f"开始解析 {len(files)} 个文件的表头")
+                self._record_operation(log, "解析开始", f"文件数={len(files)}；文件={'; '.join(files)}")
             metadata = parse_files_metadata(files)
             fields = build_field_coverage(metadata)
             if selector is not None:
                 selector.set_fields(fields)
             common_count = sum(1 for field in fields if field.is_common)
             if log is not None:
-                self._append_log(log, f"解析完成：共 {len(fields)} 个字段，公共字段 {common_count} 个")
+                field_details = "; ".join(
+                    f"{item.file_name}: 工作表={item.sheet_name}；字段数={len(item.columns)}；"
+                    f"字段类型={', '.join(f'{column.name}({column.dtype})' for column in item.columns)}"
+                    for item in metadata
+                )
+                self._record_operation(
+                    log,
+                    "解析完成",
+                    f"文件数={len(metadata)}；字段总数={len(fields)}；公共字段={common_count}；"
+                    f"字段覆盖={field_details}",
+                )
             return metadata, fields
         except Exception as exc:
             if selector is not None:
                 selector.set_fields([])
             if log is not None:
-                self._append_log(log, f"解析失败：{exc}")
+                self._record_operation(log, "解析失败", f"文件={'; '.join(files)}；错误={exc}", level="ERROR")
             self._warn(f"文件解析失败：{exc}")
             return [], []
 
@@ -1225,6 +1396,27 @@ class MainWindow(QMainWindow):
         self._refresh_history()
         self.feedback.show_error(f"{name}：{message}")
 
+    def _record_partial(
+        self,
+        name: str,
+        inputs: list[str | Path],
+        outputs: list[Path],
+        message: str,
+    ) -> None:
+        """记录部分成功的批量任务，避免历史状态误报为全成功或全失败。"""
+
+        self.history.add(
+            TaskRecord(
+                name=name,
+                status=TaskStatus.PARTIAL,
+                input_files=[Path(path) for path in inputs],
+                outputs=outputs,
+                message=message,
+            )
+        )
+        self._refresh_history()
+        self.feedback.show_warning(message)
+
     def _open_path(self, path: str | Path) -> None:
         """用系统默认程序打开输出文件。"""
 
@@ -1250,9 +1442,23 @@ class MainWindow(QMainWindow):
         self.feedback.show_warning(message)
 
     def _append_log(self, widget: LogPanel, message: str) -> None:
-        """向当前页面操作日志追加一行（LogPanel 保留了 QListWidget 的 addItem 接口）。"""
+        """兼容旧调用方式，并统一为带时间戳的详细操作日志。"""
 
-        widget.addItem(message)
+        self._record_operation(widget, "操作", message)
+
+    def _handle_rejected_files(self, widget: LogPanel, paths: list[str]) -> None:
+        """记录被拖入但格式不受支持的文件，并向用户说明支持类型。"""
+
+        supported = ".xlsx、.xls、.xlsm、.csv"
+        message = f"不支持的文件格式：{', '.join(paths)}。支持格式：{supported}"
+        self._record_operation(widget, "上传失败", message, level="WARNING")
+        self._warn(message)
+
+    def _record_operation(self, widget: LogPanel, operation: str, details: str, level: str = "INFO") -> None:
+        """向指定页面日志记录带时间、类别和详情的操作事件。"""
+
+        timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        widget.addItem(f"[{timestamp}] [{level}] [{operation}] {details}")
         widget.scrollToBottom()
 
     # ==================================================================
@@ -1315,7 +1521,11 @@ class MainWindow(QMainWindow):
         today = date.today().isoformat()
         today_items = [item for item in items if str(item.get("created_at", "")).startswith(today)]
         success = sum(1 for item in today_items if item.get("status") == TaskStatus.SUCCESS.value)
-        failed = sum(1 for item in today_items if item.get("status") == TaskStatus.FAILED.value)
+        failed = sum(
+            1
+            for item in today_items
+            if item.get("status") in {TaskStatus.FAILED.value, TaskStatus.PARTIAL.value}
+        )
         outputs = sum(len(item.get("outputs") or []) for item in items)
 
         self.stat_labels["today"].setText(str(len(today_items)))
@@ -1348,10 +1558,15 @@ class MainWindow(QMainWindow):
 
             status_item = table.item(row, 2)
             if status_item is not None:
-                succeeded = item.get("status") == TaskStatus.SUCCESS.value
-                # 状态列用颜色区分：成功绿、失败红，替代改造前的一行纯文本。
-                status_item.setText("成功" if succeeded else "失败")
-                status_item.setForeground(QColor(COLOR["success"] if succeeded else COLOR["danger"]))
+                task_status = item.get("status")
+                status_label, status_color = {
+                    TaskStatus.SUCCESS.value: ("成功", COLOR["success"]),
+                    TaskStatus.PARTIAL.value: ("部分成功", COLOR["warning"]),
+                    TaskStatus.FAILED.value: ("失败", COLOR["danger"]),
+                }.get(task_status, ("失败", COLOR["danger"]))
+                # 状态列用颜色区分成功、部分成功和失败，避免批量任务状态失真。
+                status_item.setText(status_label)
+                status_item.setForeground(QColor(status_color))
                 font = status_item.font()
                 font.setBold(True)
                 status_item.setFont(font)

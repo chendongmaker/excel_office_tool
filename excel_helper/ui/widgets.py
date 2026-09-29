@@ -67,6 +67,20 @@ def collect_table_paths(urls: list[QUrl]) -> list[str]:
     return paths
 
 
+def collect_rejected_table_paths(urls: list[QUrl]) -> list[str]:
+    """收集拖入的本地文件中不支持的格式，供界面明确提示用户。"""
+
+    rejected: list[str] = []
+    for url in urls:
+        local = url.toLocalFile()
+        if not local:
+            continue
+        candidate = Path(local)
+        if candidate.is_file() and not is_supported_file(candidate) and str(candidate) not in rejected:
+            rejected.append(str(candidate))
+    return rejected
+
+
 # ---------------------------------------------------------------------------
 # 卡片与空状态
 # ---------------------------------------------------------------------------
@@ -192,6 +206,8 @@ class FileListWidget(QFrame):
     """
 
     filesChanged = Signal(list)
+    # 将拖入的非法格式路径交给页面显示提示，避免静默忽略。
+    filesRejected = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -354,8 +370,15 @@ class FileListWidget(QFrame):
             return []
         return collect_table_paths(event.mimeData().urls())
 
+    def _rejected_paths(self, event) -> list[str]:
+        """提取拖拽中存在的非法格式文件，使 dropEvent 能反馈原因。"""
+
+        if not event.mimeData().hasUrls():
+            return []
+        return collect_rejected_table_paths(event.mimeData().urls())
+
     def dragEnterEvent(self, event) -> None:  # noqa: N802  (Qt 命名约定)
-        if self._dropped_paths(event):
+        if self._dropped_paths(event) or self._rejected_paths(event):
             event.acceptProposedAction()
             self.setProperty("dragActive", "true")
             refresh_style(self)
@@ -368,8 +391,12 @@ class FileListWidget(QFrame):
         self.setProperty("dragActive", "false")
         refresh_style(self)
         paths = self._dropped_paths(event)
+        rejected = self._rejected_paths(event)
         if paths:
             self.add_paths(paths)
+        if rejected:
+            self.filesRejected.emit(rejected)
+        if paths or rejected:
             event.acceptProposedAction()
 
 
@@ -381,6 +408,8 @@ class SingleFilePicker(QFrame):
     """
 
     fileChanged = Signal(str)
+    # 单文件选择卡复用统一信号，页面负责记录日志并提示支持格式。
+    filesRejected = Signal(list)
 
     def __init__(self, placeholder: str = "未选择文件", parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -458,8 +487,15 @@ class SingleFilePicker(QFrame):
             return []
         return collect_table_paths(event.mimeData().urls())
 
+    def _rejected_paths(self, event) -> list[str]:
+        """提取拖拽中存在的非法格式文件，使 dropEvent 能反馈原因。"""
+
+        if not event.mimeData().hasUrls():
+            return []
+        return collect_rejected_table_paths(event.mimeData().urls())
+
     def dragEnterEvent(self, event) -> None:  # noqa: N802  (Qt 命名约定)
-        if self._dropped_paths(event):
+        if self._dropped_paths(event) or self._rejected_paths(event):
             event.acceptProposedAction()
             self.setProperty("dragActive", "true")
             refresh_style(self)
@@ -472,9 +508,13 @@ class SingleFilePicker(QFrame):
         self.setProperty("dragActive", "false")
         refresh_style(self)
         paths = self._dropped_paths(event)
+        rejected = self._rejected_paths(event)
         if paths:
             # 单文件控件只接收第一个文件，多余文件忽略（页面按需提示）。
             self.set_path(paths[0])
+        if rejected:
+            self.filesRejected.emit(rejected)
+        if paths or rejected:
             event.acceptProposedAction()
 
 

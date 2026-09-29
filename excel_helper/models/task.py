@@ -12,6 +12,8 @@ class TaskStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     SUCCESS = "success"
+    # 批量任务允许部分文件成功，因此历史状态需要能表达部分完成。
+    PARTIAL = "partial"
     FAILED = "failed"
 
 

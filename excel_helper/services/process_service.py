@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -7,9 +8,47 @@ import pandas as pd
 from excel_helper.core.excel_clean import apply_clean_rules
 from excel_helper.core.excel_compare import compare_by_key
 from excel_helper.core.excel_merge import merge_by_key, merge_by_rows
-from excel_helper.core.excel_reader import read_table
+from excel_helper.core.excel_reader import list_table_files, read_table
 from excel_helper.core.excel_writer import write_table
 from excel_helper.models.rule import CleanRule
+
+
+@dataclass(slots=True)
+class BatchCleanItem:
+    """记录批量清洗中单个文件的处理结果。"""
+
+    # 当前文件的输入路径，便于调用方展示和追踪。
+    input_path: Path
+    # 成功时保存输出路径，失败时保持为空。
+    output_path: Path | None = None
+    # 文件处理失败时保存可读错误信息。
+    error: str = ""
+
+    @property
+    def succeeded(self) -> bool:
+        """根据是否生成输出路径判断当前文件是否处理成功。"""
+
+        return self.output_path is not None and not self.error
+
+
+@dataclass(slots=True)
+class BatchCleanResult:
+    """汇总文件夹批量清洗的逐文件结果。"""
+
+    # 按输入文件顺序保存每个文件的处理状态。
+    items: list[BatchCleanItem]
+
+    @property
+    def succeeded_count(self) -> int:
+        """返回成功处理的文件数量。"""
+
+        return sum(item.succeeded for item in self.items)
+
+    @property
+    def failed_count(self) -> int:
+        """返回处理失败的文件数量。"""
+
+        return len(self.items) - self.succeeded_count
 
 
 class ProcessService:
@@ -75,6 +114,39 @@ class ProcessService:
         cleaned = apply_clean_rules(frame, rules)
         return write_table(cleaned, output_path, "清洗结果")
 
+    def clean_folder(
+        self,
+        folder: str | Path,
+        output_dir: str | Path,
+        rules: list[CleanRule],
+        sheet_name: str | int = 0,
+        columns: list[str] | None = None,
+    ) -> BatchCleanResult:
+        """将同一组清洗规则应用到文件夹中的表格，并逐文件返回处理状态。
+
+        输出统一为 xlsx 格式；单个文件异常会被记录并继续处理后续文件。
+        """
+
+        source_folder = Path(folder)
+        destination = Path(output_dir)
+        # 先枚举输入文件，避免输出目录与输入目录相同时新文件被重复纳入本批次。
+        input_paths = list_table_files(source_folder)
+        if not input_paths:
+            raise ValueError(f"文件夹中没有支持的表格文件: {source_folder}")
+
+        destination.mkdir(parents=True, exist_ok=True)
+        results: list[BatchCleanItem] = []
+        for input_path in input_paths:
+            output_path = _batch_clean_output_path(input_path, destination)
+            try:
+                self.clean_file(input_path, output_path, rules, sheet_name=sheet_name, columns=columns)
+            except Exception as error:
+                # 保留失败原因并继续处理，避免一个损坏文件阻断整批任务。
+                results.append(BatchCleanItem(input_path=input_path, error=str(error)))
+            else:
+                results.append(BatchCleanItem(input_path=input_path, output_path=output_path))
+        return BatchCleanResult(items=results)
+
     def compare_files(
         self,
         left_path: str | Path,
@@ -104,3 +176,11 @@ class ProcessService:
             result["removed"].to_excel(writer, index=False, sheet_name="删除")
             result["changed"].to_excel(writer, index=False, sheet_name="修改")
         return path
+
+
+def _batch_clean_output_path(input_path: Path, output_dir: Path) -> Path:
+    """生成不覆盖输入文件且能区分同名异格式文件的 xlsx 输出路径。"""
+
+    # 加入源文件扩展名，防止同目录下同名 CSV 与 Excel 相互覆盖。
+    suffix = input_path.suffix.lower().lstrip(".")
+    return output_dir / f"{input_path.stem}_{suffix}_清洗结果.xlsx"

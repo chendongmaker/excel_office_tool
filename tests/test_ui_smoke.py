@@ -177,6 +177,39 @@ def test_clean_rules_can_be_disabled(window, sample_files):
     assert window.clean_rule_checks["strip_text"].isChecked() is True
 
 
+def test_clean_folder_selection_parses_fields(window, tmp_path, monkeypatch):
+    """清洗页选择文件夹后应启用任务并解析其中表格字段。"""
+
+    source_folder = tmp_path / "batch"
+    source_folder.mkdir()
+    pd.DataFrame({"商品": ["A"], "金额": [12]}).to_excel(source_folder / "input.xlsx", index=False)
+    monkeypatch.setattr(
+        "excel_helper.ui.main_window.QFileDialog.getExistingDirectory",
+        lambda *_args, **_kwargs: str(source_folder),
+    )
+
+    window._select_clean_folder()
+
+    assert window.clean_folder_path == str(source_folder)
+    assert window.clean_run_button.isEnabled() is True
+    assert {field.name for field in window.clean_field_selector.fields} == {"商品", "金额"}
+
+
+def test_rejected_drop_reports_supported_formats(window, tmp_path):
+    """拖入不支持的格式时应在操作日志和反馈条给出明确提示。"""
+
+    from PySide6.QtWidgets import QLabel
+
+    unsupported = tmp_path / "notes.txt"
+    unsupported.write_text("not a spreadsheet", encoding="utf-8")
+
+    window._handle_rejected_files(window.clean_log, [str(unsupported)])
+
+    assert window.feedback.property("state") == "warning"
+    message = window.feedback.findChild(QLabel, "FeedbackText")
+    assert message is not None and ".xlsx" in message.text()
+
+
 def test_history_table_renders_records_and_empty_state(window):
     """历史记录写入后表格可渲染，清空后回到空状态。"""
 
